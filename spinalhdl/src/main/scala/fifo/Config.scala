@@ -1,4 +1,4 @@
-package projectname
+package fifo
 
 import spinal.core._
 import spinal.core.sim._
