@@ -41,6 +41,7 @@ class GCD extends Module {
 object GCD extends App {
   ChiselStage.emitSystemVerilogFile(
     new GCD,
+    args = Array("--target-dir", "gen"),
     firtoolOpts = Array("-disable-all-randomization", "-strip-debug-info")
   )
 }
