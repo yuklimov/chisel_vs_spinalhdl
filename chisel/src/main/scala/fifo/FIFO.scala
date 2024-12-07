@@ -8,7 +8,7 @@ import chisel3.experimental.BundleLiterals._
 import _root_.circt.stage.ChiselStage
 
 class VData[T <: Data](T : T) extends Bundle {
-  val data  = T // T.cloneType, если нужно несколько полей T
+  val data  = T
   val valid = Bool()
 }
 
@@ -17,9 +17,9 @@ class HandShake[T <: Data](T : T) extends Bundle {
   val ready = Input(Bool())
 }
 
-class FIFOWriteController[T <: Data](T : T, depth : Int) extends Module {
+class WrCntr[T <: Data](T : T, depth : Int) extends Module {
   val i_port = IO(Flipped(new HandShake(T)))
-  val o_wmem = IO(new Bundle {
+  val o_mem  = IO(new Bundle {
     val addr = Output(UInt(depth.W))
     val data = Output(T)
     val en   = Output(Bool())
@@ -27,23 +27,26 @@ class FIFOWriteController[T <: Data](T : T, depth : Int) extends Module {
   val i_addr = IO(Input(UInt((depth+1).W)))
   val o_addr = IO(Output(UInt((depth+1).W)))
 
+  // Регистр адреса записи
   val addr = RegInit(0.U((depth+1).W))
-  when (o_wmem.en) {
+  when (o_mem.en) {
     addr := addr+1.U
   }
 
+  // Можем принять данные, если в памяти есть место
   i_port.ready := addr =/= (i_addr+(1.U<<depth))
 
-  o_wmem.addr := addr
-  o_wmem.data := i_port.vdata.data
-  o_wmem.en   := i_port.ready & i_port.vdata.valid
+  // Пишем в память, если можем принять данные и если пришли данные
+  o_mem.addr := addr
+  o_mem.data := i_port.vdata.data
+  o_mem.en   := i_port.ready & i_port.vdata.valid
 
   o_addr := addr
 }
 
-class FIFOReadController[T <: Data](T : T, depth : Int) extends Module {
+class RdCntr[T <: Data](T : T, depth : Int) extends Module {
   val o_port = IO(new HandShake(T))
-  val o_rmem = IO(new Bundle {
+  val o_mem  = IO(new Bundle {
     val addr = Output(UInt(depth.W))
     val data = Input(T)
     val en   = Output(Bool())
@@ -51,22 +54,20 @@ class FIFOReadController[T <: Data](T : T, depth : Int) extends Module {
   val i_addr = IO(Input(UInt((depth+1).W)))
   val o_addr = IO(Output(UInt((depth+1).W)))
 
+  // Регистр адреса чтения
   val addr = RegInit(0.U((depth+1).W))
-
-  val buf0 = Wire(new VData(T))
-  val buf1 = RegInit((new VData(T)).Lit(_.valid -> false.B))
-  val buf2 = RegInit({ val init = Wire(new VData(T)); init := DontCare; init.valid := false.B; init })
-
-  o_rmem.addr := addr
-  o_rmem.en   := addr =/= i_addr && ( o_port.ready ||
-                                      ((buf0.valid || buf1.valid || buf2.valid) === false.B) ||
-                                      ((buf0.valid ^ buf1.valid ^ buf1.valid) === true.B && (buf0.valid && buf1.valid && buf1.valid) === false.B) )
-  when (o_rmem.en) {
+  when (o_mem.en) {
     addr := addr+1.U
   }
 
-  buf0.data  := o_rmem.data
-  buf0.valid := RegNext(o_rmem.en, false.B)
+  // Результат чтения из памяти
+  val buf0 = Wire(new VData(T))
+  buf0.data  := o_mem.data
+  buf0.valid := RegNext(o_mem.en, false.B)
+
+  // Регистры skid buffer'а
+  val buf1 = RegInit((new VData(T)).Lit(_.valid -> false.B))
+  val buf2 = RegInit({ val init = Wire(new VData(T)); init := DontCare; init.valid := false.B; init })
 
   when (buf0.valid || !buf2.valid) {
     buf1 := buf0;
@@ -78,6 +79,13 @@ class FIFOReadController[T <: Data](T : T, depth : Int) extends Module {
     buf2 := buf1
   }
 
+  // Читаем из памяти, если в памяти есть данные и просят данные или если в buf0, buf1 и buf2 не более одного валидного данного
+  o_mem.addr := addr
+  o_mem.en   := addr =/= i_addr && ( o_port.ready ||
+                                     ((buf0.valid || buf1.valid || buf2.valid) === false.B) ||
+                                     ((buf0.valid ^ buf1.valid ^ buf1.valid) === true.B && (buf0.valid && buf1.valid && buf1.valid) === false.B) )
+
+  // Выдаем данные либо из buf2, либо из buf1
   o_port.vdata := Mux(buf2.valid, buf2, buf1);
 
   o_addr := addr
@@ -87,20 +95,24 @@ class FIFO[T <: Data](T : T, depth : Int) extends Module {
   val i_port = IO(Flipped(new HandShake(T)))
   val o_port = IO(new HandShake(T))
 
-  val mem = SyncReadMem(1<<depth, T)
-  val wctrl = Module(new FIFOWriteController(T, depth))
-  val rctrl = Module(new FIFOReadController(T, depth))
+  // Описание внутренних модулей
+  val wctrl = Module(new WrCntr(T, depth))
+  val rctrl = Module(new RdCntr(T, depth))
 
+  // Подключение портов
   wctrl.i_port <> i_port
   rctrl.o_port <> o_port
 
-  when (wctrl.o_wmem.en) {
-    mem.write(wctrl.o_wmem.addr, wctrl.o_wmem.data)
-  }
-  rctrl.o_rmem.data := mem.read(rctrl.o_rmem.addr, rctrl.o_rmem.en)
-
+  // Подключение сигналов
   wctrl.i_addr := rctrl.o_addr
   rctrl.i_addr := wctrl.o_addr
+
+  // Объявление и использование памяти
+  val mem = SyncReadMem(1<<depth, T)
+  when (wctrl.o_mem.en) {
+    mem.write(wctrl.o_mem.addr, wctrl.o_mem.data)
+  }
+  rctrl.o_mem.data := mem.read(rctrl.o_mem.addr, rctrl.o_mem.en)
 }
 
 object FIFOSystemVerilog extends App {
